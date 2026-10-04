@@ -9,6 +9,10 @@ function feed(seed,range,shape,rows,biomes=null,centerX=17,centerZ=-19,target='s
  return scan.finish();
 }
 async function main(){
+ const words=new Uint32Array([0,1,8,4,65536,65536,0,0,1,1,9,4,65537,65536,0,0]);
+ assert.equal(Compute.reduceCandidates(words).count,4294967297);
+ const tie=new Uint32Array([6,0,1,1,2,3,0,0,6,0,1,1,3,2,0,0]);
+ assert.deepEqual(Compute.reduceCandidates(tie),{count:6,minX:1,minZ:1,width:3,height:2});
  let comparisons=0;
  for(const seed of ['0','-1','9007199254740993'])for(const range of [1,80,257])for(const shape of ['square','rectangle'])for(const rows of [1,3,16]){
   assert.deepEqual(clean(feed(seed,range,shape,rows)),clean(Farm.searchChunkCluster(seed,range,'slime',shape,()=>{},null,17,-19)));comparisons++;

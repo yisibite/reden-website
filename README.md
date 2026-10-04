@@ -80,6 +80,35 @@ pnpm dev
 └── content/            # 内容文件（markdown）
 ```
 
+### Farm generator GPU shape search
+
+`tools/slime-farm-generator/browser_compute.js` keeps slime square/rectangle
+histograms, exact shape scoring and candidate reduction on WebGPU. Each batch
+returns only one best candidate per workgroup, with the original north/west tie
+order. Area comparisons use two 32-bit words to avoid overflow. State survives
+batch boundaries; no complete world grid is retained. Non-slime biome filtering
+and other search modes retain their existing paths; automatic GPU failure
+restarts with the CPU oracle from the first row. Cancellation terminates the worker.
+
+This follows the GPU filtering / small readback architecture discussed in
+[minelogy's slime-calculator](https://github.com/minelogy-dev/slime-calculator/tree/f7f24095b006e9d1405a69f2aa7bfb591261254d).
+No CUDA code is copied, and arbitrary maximum solid shapes are still searched.
+
+Checks: `npm test --prefix tools/slime-farm-generator`,
+`python tools/slime-farm-generator/build.py`, and optional DOM startup integration.
+For real GPU oracle tests, run
+`node tools/slime-farm-generator/test_gpu_shapes.js public/gpu-shape-check.html`,
+serve `public` on localhost and click its test button. Remove that temporary HTML
+afterwards. It compares 36 cases with the CPU, including large seeds, distant
+negative coordinates and multiple GPU batches.
+
+On the tested RTX 5080, seed 0 / radius 216,000 rectangle search completed in
+1.1 seconds (previous GPU + CPU scorer: 7.5 seconds), with identical coordinates.
+A world-border run was cancelled at row 366,464 / 3,749,876. Its 53.443-second
+steady sample advanced 271,488 rows: approximately 5,080 rows/s, implying about
+12.3 minutes for the full range. This is an extrapolation, not a completed scan;
+other hardware is unmeasured. Screenshots and local timing files are not shipped.
+
 ### 📄 许可证
 
 此项目是开源的，采用 AGPL v3 许可证。

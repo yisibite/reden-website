@@ -22,7 +22,7 @@ fn next(s:vec2<u32>)->vec2<u32> {
 }
 @compute @workgroup_size(256)
 fn grid(@builtin(global_invocation_id) id:vec3<u32>,@builtin(local_invocation_index) lane:u32) {
- let i=id.x; flags[lane]=0u;
+ let i=id.x+id.y*p.unused0; flags[lane]=0u;
  if(i<p.width*p.height){
  let a=xs[i%p.width]; let b=zs[i/p.width]; let lo=a.x+b.x;
  var s=vec2<u32>(lo,(a.y+b.y+select(0u,1u,lo<a.x))&65535u);
@@ -39,8 +39,121 @@ fn grid(@builtin(global_invocation_id) id:vec3<u32>,@builtin(local_invocation_in
   output[i/32u]=packed;
  }
 }`;
+  // Exact maximum shapes, not a fixed-size/threshold substitute. Histogram state
+  // survives batches; every positive column is considered on the device.
+  const shapeShader=`
+struct ShapeParams { width:u32, row:u32, base:u32, square:u32 }
+struct Candidate { low:u32, high:u32, x:u32, z:u32, width:u32, height:u32, pad0:u32, pad1:u32 }
+@group(0) @binding(0) var<storage,read> bits:array<u32>;
+@group(0) @binding(1) var<storage,read_write> heights:array<u32>;
+@group(0) @binding(2) var<storage,read_write> best:array<Candidate>;
+@group(0) @binding(3) var<uniform> p:ShapeParams;
+var<workgroup> choices:array<Candidate,256>;
+${shader.slice(shader.indexOf('fn highProduct'),shader.indexOf('fn next'))}
+fn better(a:Candidate,b:Candidate)->bool {
+ if(a.high!=b.high){return a.high>b.high;}
+ if(a.low!=b.low){return a.low>b.low;}
+ if(a.z!=b.z){return a.z<b.z;}
+ if(a.x!=b.x){return a.x<b.x;}
+ if(a.z+a.height!=b.z+b.height){return a.z+a.height<b.z+b.height;}
+ return a.x+a.width<b.x+b.width;
+}
+@compute @workgroup_size(256)
+fn advance(@builtin(global_invocation_id) id:vec3<u32>){
+ let x=id.x;if(x>=p.width){return;}
+ let i=p.row*p.width+x;
+ heights[x]=select(0u,heights[x]+1u,((bits[i>>5u]>>(i&31u))&1u)!=0u);
+}
+@compute @workgroup_size(256)
+fn score(@builtin(global_invocation_id) id:vec3<u32>,@builtin(local_invocation_index) lane:u32,@builtin(workgroup_id) group:vec3<u32>){
+ let x=id.x;var c=Candidate(0u,0u,0u,0u,0u,0u,0u,0u);
+ if(x<p.width){
+  let h=heights[x];let z=p.base+p.row;
+  if(h>0u){
+   if(p.square!=0u){
+    var side=0u;var minimum=h;
+    loop {
+     if(side>=h || side>x){break;}
+     minimum=min(minimum,heights[x-side]);
+     if(minimum<side+1u){break;}
+     side+=1u;
+    }
+    c=Candidate(side*side,highProduct(side,side),x-side+1u,z-side+1u,side,side,0u,0u);
+   }else{
+    var left=x;var right=x+1u;
+    loop {if(left==0u){break;}if(heights[left-1u]<h){break;}left-=1u;}
+    loop {if(right>=p.width){break;}if(heights[right]<h){break;}right+=1u;}
+    let w=right-left;c=Candidate(w*h,highProduct(w,h),left,z-h+1u,w,h,0u,0u);
+   }
+  }
+ }
+ choices[lane]=c;workgroupBarrier();
+ var stride=128u;
+ loop {
+  if(lane<stride){let other=choices[lane+stride];if(better(other,choices[lane])){choices[lane]=other;}}
+  workgroupBarrier();if(stride==1u){break;}stride>>=1u;
+ }
+ if(lane==0u && better(choices[0],best[group.x])){best[group.x]=choices[0];}
+}`;
   const mask=(1n<<48n)-1n;
   const pair=(array,i,value)=>{value&=mask;array[i*2]=Number(value&0xffffffffn);array[i*2+1]=Number(value>>32n);};
+  function reduceCandidates(words,best={count:0,minX:0,minZ:0,width:0,height:0}){
+    for(let i=0;i<words.length;i+=8){
+      const count=words[i]+words[i+1]*4294967296,minX=words[i+2],minZ=words[i+3],width=words[i+4],height=words[i+5];
+      if(count>best.count||count===best.count&&count>0&&(minZ<best.minZ||minZ===best.minZ&&(minX<best.minX||minX===best.minX&&(minZ+height<best.minZ+best.height||minZ+height===best.minZ+best.height&&minX+width<best.minX+best.width))))best={count,minX,minZ,width,height};
+    }
+    return best;
+  }
+  async function gpuShapes(data,onProgress=()=>{},gpu=globalThis.navigator?.gpu){
+    if(!gpu)throw new Error('浏览器未提供 WebGPU；请使用本机 CPU 或支持 WebGPU 的安全页面。');
+    const started=performance.now(),{seed,range,shape,centerX=0,centerZ=0}=data;
+    const bounds=SlimeFarm.searchBounds(range,centerX,centerZ),n=bounds.cmax-bounds.cmin+1,h=bounds.zmax-bounds.zmin+1;
+    const adapter=await gpu.requestAdapter();if(!adapter)throw new Error('没有可用的本机 WebGPU 设备。');
+    const device=await adapter.requestDevice(),buffers=[];
+    let lost=null;device.lost.then(info=>{lost=info.message||'GPU 设备已断开';});
+    try{
+      if(n*8>device.limits.maxStorageBufferBindingSize)throw new Error('GPU 不支持该搜索行宽。');
+      const groups=Math.ceil(n/256),batchRows=Math.max(1,Math.min(128,Math.floor(device.limits.maxStorageBufferBindingSize*8/n),Math.floor(0xffffffff/n)));
+      const flagBytes=Math.ceil(n*batchRows/32)*4,candidateBytes=groups*32;
+      const make=(size,usage)=>{const b=device.createBuffer({size,usage});buffers.push(b);return b;};
+      const xbuf=make(n*8,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST),zbuf=make(batchRows*8,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST);
+      const flags=make(flagBytes,GPUBufferUsage.STORAGE),heights=make(n*4,GPUBufferUsage.STORAGE);
+      const bestBuffer=make(candidateBytes,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC),read=make(candidateBytes,GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST);
+      const gridParams=make(16,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST),shapeParams=make(batchRows*256,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST);
+      device.pushErrorScope('validation');
+      const gridModule=device.createShaderModule({code:shader}),shapeModule=device.createShaderModule({code:shapeShader});
+      for(const module of [gridModule,shapeModule]){const info=await module.getCompilationInfo();const errors=info.messages.filter(m=>m.type==='error');if(errors.length)throw new Error(errors.map(m=>m.message).join('; '));}
+      const pipelines=[];for(const [module,entryPoint] of [[gridModule,'grid'],[shapeModule,'advance'],[shapeModule,'score']])pipelines.push(await device.createComputePipelineAsync({layout:'auto',compute:{module,entryPoint}}));
+      const error=await device.popErrorScope();if(error)throw new Error(error.message);
+      const gridBind=device.createBindGroup({layout:pipelines[0].getBindGroupLayout(0),entries:[xbuf,zbuf,flags,gridParams].map((buffer,binding)=>({binding,resource:{buffer}}))});
+      // Auto-layout omits bindings unused by an entry point.
+      const rowBinds=Array.from({length:batchRows},(_,row)=>pipelines.slice(1).map((pipeline,index)=>device.createBindGroup({layout:pipeline.getBindGroupLayout(0),entries:(index===0?[0,1,3]:[1,2,3]).map(binding=>({binding,resource:binding===3?{buffer:shapeParams,offset:row*256,size:16}:{buffer:[flags,heights,bestBuffer][binding]}}))})));
+      const xs=new Uint32Array(n*2),zs=new Uint32Array(batchRows*2),params=new Uint32Array(batchRows*64),b=BigInt(seed);
+      for(let x=0;x<n;x++){const c=bounds.cmin+x;pair(xs,x,b+BigInt(Math.imul(Math.imul(c,c),4987142))+BigInt(Math.imul(c,5947611)));}
+      device.queue.writeBuffer(xbuf,0,xs);
+      let best={count:0,minX:0,minZ:0,width:0,height:0},readbackBytes=0;
+      for(let row=0;row<h;row+=batchRows){
+        if(lost)throw new Error(lost);
+        const rows=Math.min(batchRows,h-row),workgroups=Math.ceil(n*rows/256),gx=Math.min(workgroups,device.limits.maxComputeWorkgroupsPerDimension);
+        for(let z=0;z<rows;z++){const c=bounds.zmin+row+z;pair(zs,z,BigInt(Math.imul(c,c))*4392871n+BigInt(Math.imul(c,389711)));params.set([n,z,row,shape==='square'?1:0],z*64);}
+        device.queue.writeBuffer(zbuf,0,zs);device.queue.writeBuffer(gridParams,0,new Uint32Array([n,rows,gx*256,0]));device.queue.writeBuffer(shapeParams,0,params);
+        device.pushErrorScope('validation');
+        const encoder=device.createCommandEncoder(),pass=encoder.beginComputePass();
+        pass.setPipeline(pipelines[0]);pass.setBindGroup(0,gridBind);pass.dispatchWorkgroups(gx,Math.ceil(workgroups/gx));
+        for(let z=0;z<rows;z++)for(let index=0;index<2;index++){pass.setPipeline(pipelines[index+1]);pass.setBindGroup(0,rowBinds[z][index]);pass.dispatchWorkgroups(groups);}
+        pass.end();encoder.copyBufferToBuffer(bestBuffer,0,read,0,candidateBytes);device.queue.submit([encoder.finish()]);
+        await read.mapAsync(GPUMapMode.READ);try{best=reduceCandidates(new Uint32Array(read.getMappedRange()),best);}finally{read.unmap();}
+        const validation=await device.popErrorScope();if(validation)throw new Error(validation.message);
+        readbackBytes+=candidateBytes;
+        onProgress({phase:'shape',progress:(row+rows)/h,message:`本机 GPU 求最大${shape==='square'?'正方形':'矩形'}：${row+rows} / ${h} 行；当前最多 ${best.count} 个区块`});
+      }
+      if(lost)throw new Error(lost);
+      const result={seed:String(seed),range,centerX,centerZ,target:'slime',shape,gridChunks:n*h,found:best.count>0,biome:null,elapsedMs:performance.now()-started,execution:{backend:'gpu',fallbackReason:'',strategy:'gpu-shape',peakGridCells:0,stateBytes:n*4,readbackBytes}};
+      if(!best.count)return result;
+      const chunks={minX:bounds.cmin+best.minX,maxX:bounds.cmin+best.minX+best.width-1,minZ:bounds.zmin+best.minZ,maxZ:bounds.zmin+best.minZ+best.height-1};
+      return {...result,count:best.count,width:best.width,height:best.height,chunks,blocks:{minX:chunks.minX*16,maxX:chunks.maxX*16+15,minZ:chunks.minZ*16,maxZ:chunks.maxZ*16+15},coordinates:null,rectangles:null};
+    }finally{for(const b of buffers)b.destroy();device.destroy();}
+  }
   async function grid(seed,bounds,onProgress=()=>{},gpu=globalThis.navigator?.gpu,consume=null) {
     if(!gpu)throw new Error('浏览器未提供 WebGPU；请使用本机 CPU 或支持 WebGPU 的安全页面。');
     const adapter=await gpu.requestAdapter();
@@ -97,7 +210,7 @@ fn grid(@builtin(global_invocation_id) id:vec3<u32>,@builtin(local_invocation_in
     let scan=SlimeFarm.chunkRowScan(seed,range,target,shape,biomes,centerX,centerZ),backend='cpu',reason='',peakGridCells=0;
     const accept=g=>{peakGridCells=Math.max(peakGridCells,g.grid.length);scan.consume(g);};
     if(compute==='gpu'||compute==='auto'&&scan.n*scan.h>=4194304){
-      try{await grid(seed,scan.bounds,onProgress,globalThis.navigator?.gpu,accept);backend='gpu';}
+      try{if(target==='slime')return await gpuShapes(data,onProgress);await grid(seed,scan.bounds,onProgress,globalThis.navigator?.gpu,accept);backend='gpu';}
       catch(error){
         if(compute==='gpu')throw error;
         reason=error.message;scan=SlimeFarm.chunkRowScan(seed,range,target,shape,biomes,centerX,centerZ);
@@ -135,6 +248,6 @@ fn grid(@builtin(global_invocation_id) id:vec3<u32>,@builtin(local_invocation_in
       :SlimeFarm.searchChunkCluster(seed,range,data.target,data.shape,onProgress,data.biomes,centerX,centerZ));
     result.execution={backend,fallbackReason:reason};return result;
   }
-  return {grid,run};
+  return {grid,run,reduceCandidates};
 })();
 if(typeof module!=='undefined')module.exports=SlimeLocalCompute;

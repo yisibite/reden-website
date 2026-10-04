@@ -109,6 +109,34 @@ steady sample advanced 271,488 rows: approximately 5,080 rows/s, implying about
 12.3 minutes for the full range. This is an extrapolation, not a completed scan;
 other hardware is unmeasured. Screenshots and local timing files are not shipped.
 
+### Farm spawning-area screening
+
+Farm mode fuses GPU bitmap generation with admissible 17x17 window bounds.
+Only candidates whose bound can reach the current best score are read back.
+Batches cover 128 chunk rows; the shared CPU/GPU `searchSteps` reducer still
+updates the best score every 16 rows. Equality survives pruning to preserve
+all tied winners. The CPU still evaluates each candidate's valid block centers,
+24-128 block annulus, imported-biome/structure exclusions and distance ties.
+CPU fallback restarts the exact reducer. The search range remains 216,000;
+preview/export retains the existing complete grid and associated memory cost.
+
+Real RTX 5080 browser A/B, seed 0, radius 216,000: old GPU grid + CPU screen
+5,576.7 ms, GPU screen + shared precision reducer 4,445.3 ms. Both returned
+area 12,301 at X 32,752 / Z -69,153 with one tied winner. This includes GPU grid
+preparation and scoring, but excludes schematic construction/download and UI
+rendering. Radius 108,000 measured 1,431.4 / 1,376.8 ms; that small difference
+should not be generalized to other machines. No world-wide farm run performed.
+The reference is minelogy's fused bitmap/candidate filtering architecture,
+with no CUDA source copied.
+
+`node tools/slime-farm-generator/test_gpu_farm.js public/gpu-farm-check.html`
+creates a button-driven GPU/CPU oracle page with 18 cases, including imported
+deep-dark and structure exclusions. `bench_gpu_farm.js` creates the analogous
+A/B benchmark page. Serve on localhost, click once, and remove generated test
+HTML afterwards. The full Node test suite and DOM startup integration also
+passed; DOM tests are not browser evidence. No Nuxt production-build rerun
+for this static worker update.
+
 ### 📄 许可证
 
 此项目是开源的，采用 AGPL v3 许可证。
